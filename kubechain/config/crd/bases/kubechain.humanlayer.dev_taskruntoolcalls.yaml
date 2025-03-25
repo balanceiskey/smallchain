@@ -103,6 +103,9 @@ spec:
               error:
                 description: Error message if the tool call failed
                 type: string
+              humanLayerCallId:
+                description: HumanLayerCallId is the ID of function call in HumanLayer
+                type: string
               phase:
                 description: Phase indicates the current phase of the tool call
                 enum:

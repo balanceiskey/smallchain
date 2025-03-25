@@ -21,6 +21,7 @@ import (
 	kubechainv1alpha1 "github.com/humanlayer/smallchain/kubechain/api/v1alpha1"
 	externalapi "github.com/humanlayer/smallchain/kubechain/internal/externalAPI"
 	"github.com/humanlayer/smallchain/kubechain/internal/humanlayer"
+	"github.com/humanlayer/smallchain/kubechain/internal/humanlayerapi"
 	"github.com/humanlayer/smallchain/kubechain/internal/mcpmanager"
 )
 
@@ -643,6 +644,47 @@ func (r *TaskRunToolCallReconciler) getMCPServer(ctx context.Context, trtc *kube
 	return &mcpServer, mcpServer.Spec.ApprovalContactChannel != nil, nil
 }
 
+// getContactChannel fetches and validates the ContactChannel resource
+func (r *TaskRunToolCallReconciler) getContactChannel(ctx context.Context, trtc *kubechainv1alpha1.TaskRunToolCall, mcpServer *kubechainv1alpha1.MCPServer) (*kubechainv1alpha1.ContactChannel, error) {
+	logger := log.FromContext(ctx)
+
+	// Get the ContactChannel resource
+	var contactChannel kubechainv1alpha1.ContactChannel
+	if err := r.Get(ctx, client.ObjectKey{
+		Namespace: trtc.Namespace,
+		Name:      mcpServer.Spec.ApprovalContactChannel.Name,
+	}, &contactChannel); err != nil {
+		logger.Error(err, "Failed to get ContactChannel",
+			"contactChannel", mcpServer.Spec.ApprovalContactChannel.Name)
+		trtc.Status.Status = StatusError
+		trtc.Status.StatusDetail = fmt.Sprintf("Failed to get ContactChannel: %v", err)
+		trtc.Status.Error = err.Error()
+		r.recorder.Event(trtc, corev1.EventTypeWarning, "ValidationFailed", err.Error())
+		if err := r.Status().Update(ctx, trtc); err != nil {
+			logger.Error(err, "Failed to update status")
+			return nil, err
+		}
+		return nil, err
+	}
+
+	// Validate that the ContactChannel is ready
+	if !contactChannel.Status.Ready {
+		err := fmt.Errorf("ContactChannel %s is not ready: %s", contactChannel.Name, contactChannel.Status.StatusDetail)
+		logger.Error(err, "ContactChannel not ready")
+		trtc.Status.Status = StatusError
+		trtc.Status.StatusDetail = err.Error()
+		trtc.Status.Error = err.Error()
+		r.recorder.Event(trtc, corev1.EventTypeWarning, "ValidationFailed", err.Error())
+		if err := r.Status().Update(ctx, trtc); err != nil {
+			logger.Error(err, "Failed to update status")
+			return nil, err
+		}
+		return nil, err
+	}
+
+	return &contactChannel, nil
+}
+
 // Reconcile processes TaskRunToolCall objects.
 func (r *TaskRunToolCallReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -678,16 +720,161 @@ func (r *TaskRunToolCallReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{}, err
 		}
 
+		// No approval yet? Get back in the loop.
+		if needsApproval && trtc.Status.Status == "AwaitingHumanApproval" {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
 		if needsApproval {
+			// Get and validate the ContactChannel
+			contactChannel, err := r.getContactChannel(ctx, &trtc, mcpServer)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// update status
 			trtc.Status.Status = "AwaitingHumanApproval"
-			trtc.Status.StatusDetail = fmt.Sprintf("Waiting for human approval via contact channel %s", mcpServer.Spec.ApprovalContactChannel.Name)
+			trtc.Status.StatusDetail = fmt.Sprintf("Waiting for human approval via contact channel %s (%s)", contactChannel.Name, contactChannel.Spec.ChannelType)
 			r.recorder.Event(&trtc, corev1.EventTypeNormal, "AwaitingHumanApproval",
-				fmt.Sprintf("Tool execution requires approval via contact channel %s", mcpServer.Spec.ApprovalContactChannel.Name))
+				fmt.Sprintf("Tool execution requires approval via contact channel %s (%s)", contactChannel.Name, contactChannel.Spec.ChannelType))
 
 			if err := r.Status().Update(ctx, &trtc); err != nil {
 				logger.Error(err, "Failed to update TaskRunToolCall status")
 				return ctrl.Result{}, err
 			}
+
+			if contactChannel != nil {
+				r.recorder.Event(&trtc, corev1.EventTypeNormal, "ContactChannelFound",
+					fmt.Sprintf("Using contact channel %s of type %s for approval", contactChannel.Name, contactChannel.Spec.ChannelType))
+
+				// Get API key from secret
+				var secret corev1.Secret
+				err := r.Get(ctx, client.ObjectKey{
+					Namespace: trtc.Namespace,
+					Name:      contactChannel.Spec.APIKeyFrom.SecretKeyRef.Name,
+				}, &secret)
+				if err != nil {
+					logger.Error(err, "Failed to get API key secret")
+					trtc.Status.Status = "ErrorRequestingHumanApproval"
+					trtc.Status.StatusDetail = fmt.Sprintf("Failed to get API key: %v", err)
+					trtc.Status.Error = err.Error()
+					if err := r.Status().Update(ctx, &trtc); err != nil {
+						logger.Error(err, "Failed to update status after secret fetch error")
+					}
+					return ctrl.Result{}, err
+				}
+
+				apiKey := string(secret.Data[contactChannel.Spec.APIKeyFrom.SecretKeyRef.Key])
+				if apiKey == "" {
+					err := fmt.Errorf("empty API key in secret %s", contactChannel.Spec.APIKeyFrom.SecretKeyRef.Name)
+					logger.Error(err, "Empty API key")
+					trtc.Status.Status = "ErrorRequestingHumanApproval"
+					trtc.Status.StatusDetail = err.Error()
+					trtc.Status.Error = err.Error()
+					if err := r.Status().Update(ctx, &trtc); err != nil {
+						logger.Error(err, "Failed to update status after empty API key error")
+					}
+					return ctrl.Result{}, err
+				}
+
+				r.recorder.Event(&trtc, corev1.EventTypeNormal, "APIKeyFound",
+					fmt.Sprintf("Found API key in secret %s", contactChannel.Spec.APIKeyFrom.SecretKeyRef.Name))
+
+				// Initialize client with API key
+				hlClient, err := humanlayer.NewHumanLayerClient("", apiKey)
+				if err != nil {
+					trtc.Status.Status = "ErrorRequestingHumanApproval"
+					trtc.Status.StatusDetail = fmt.Sprintf("Failed to initialize HumanLayer client: %v", err)
+					trtc.Status.Error = err.Error()
+					if err := r.Status().Update(ctx, &trtc); err != nil {
+						logger.Error(err, "Failed to update status after client initialization error")
+					}
+					return ctrl.Result{}, err
+				}
+
+				// Create the contact channel input based on the channel type
+				channel := humanlayerapi.NewContactChannelInput()
+				switch contactChannel.Spec.ChannelType {
+				case "slack":
+					if contactChannel.Spec.SlackConfig == nil {
+						return ctrl.Result{}, fmt.Errorf("slack channel type requires SlackConfig")
+					}
+					slackChannel := humanlayerapi.NewSlackContactChannelInput(contactChannel.Spec.SlackConfig.ChannelOrUserID)
+					if contactChannel.Spec.SlackConfig.ContextAboutChannelOrUser != "" {
+						slackChannel.SetContextAboutChannelOrUser(contactChannel.Spec.SlackConfig.ContextAboutChannelOrUser)
+					}
+					channel.SetSlack(*slackChannel)
+
+				case "email":
+					if contactChannel.Spec.EmailConfig == nil {
+						return ctrl.Result{}, fmt.Errorf("email channel type requires EmailConfig")
+					}
+					emailChannel := humanlayerapi.NewEmailContactChannel(contactChannel.Spec.EmailConfig.Address)
+					if contactChannel.Spec.EmailConfig.ContextAboutUser != "" {
+						emailChannel.SetContextAboutUser(contactChannel.Spec.EmailConfig.ContextAboutUser)
+					}
+					if contactChannel.Spec.EmailConfig.Subject != "" {
+						emailChannel.SetExperimentalSubjectLine(contactChannel.Spec.EmailConfig.Subject)
+					}
+					channel.SetEmail(*emailChannel)
+
+				default:
+					return ctrl.Result{}, fmt.Errorf("unsupported channel type: %s", contactChannel.Spec.ChannelType)
+				}
+
+				// Create the function call input with required parameters
+				spec := humanlayerapi.NewFunctionCallSpecInput("approve_tool_call", map[string]interface{}{
+					"tool_name": trtc.Spec.ToolRef.Name,
+					"task_run":  trtc.Spec.TaskRunRef.Name,
+					"namespace": trtc.Namespace,
+				})
+
+				spec.SetChannel(*channel)
+
+				functionCallInput := humanlayerapi.NewFunctionCallInput(trtc.Spec.ToolRef.Name, "", *spec)
+
+				// Send the request for approval
+				functionCall, _, err := hlClient.DefaultAPI.RequestApproval(ctx).FunctionCallInput(*functionCallInput).Execute()
+				if err != nil {
+					trtc.Status.Status = "ErrorRequestingHumanApproval"
+					trtc.Status.StatusDetail = fmt.Sprintf("Failed to request human approval: %v", err)
+					trtc.Status.Error = err.Error()
+					if err := r.Status().Update(ctx, &trtc); err != nil {
+						logger.Error(err, "Failed to update status after approval request error")
+					}
+					return ctrl.Result{}, err
+				}
+
+				functionCallId := functionCall.GetCallId()
+
+				if functionCallId == "" {
+					trtc.Status.Status = "ErrorRequestingHumanApproval"
+					trtc.Status.StatusDetail = fmt.Sprintf("No function call ID returned from HumanLayer")
+					trtc.Status.Error = "No function call ID returned from HumanLayer"
+					if err := r.Status().Update(ctx, &trtc); err != nil {
+						logger.Error(err, "Failed to update status after no function call ID returned from HumanLayer")
+					}
+					return ctrl.Result{}, err
+				}
+
+				r.recorder.Event(&trtc, corev1.EventTypeNormal, "SundeepIsTired", "Sundeep is mostly just trying to see what is going on and will remove this")
+				if err := r.Status().Update(ctx, &trtc); err != nil {
+					logger.Error(err, "Failed to update TaskRunToolCall status")
+					return ctrl.Result{}, err
+				}
+
+				// Update status with the call ID
+				trtc.Status.HumanLayerCallId = functionCall.GetCallId()
+
+				if err := r.Status().Update(ctx, &trtc); err != nil {
+					logger.Error(err, "Failed to update TaskRunToolCall status after requesting human approval")
+					return ctrl.Result{}, err
+				}
+
+				// requeue in 5s
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
 			return ctrl.Result{}, nil
 		}
 	}
