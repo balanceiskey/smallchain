@@ -2,6 +2,7 @@ package llmclient
 
 import (
 	"context"
+	"fmt"
 
 	kubechainv1alpha1 "github.com/humanlayer/smallchain/kubechain/api/v1alpha1"
 )
@@ -35,4 +36,20 @@ type ToolFunctionParameters struct {
 	Type       string                           `json:"type"`
 	Properties map[string]ToolFunctionParameter `json:"properties"`
 	Required   []string                         `json:"required,omitempty"`
+}
+
+// LLMRequestError represents an error that occurred during an LLM request
+// and includes HTTP status code information
+type LLMRequestError struct {
+	StatusCode int
+	Message    string
+	Err        error
+}
+
+func (e *LLMRequestError) Error() string {
+	return fmt.Sprintf("LLM request failed with status %d: %s", e.StatusCode, e.Message)
+}
+
+func (e *LLMRequestError) Unwrap() error {
+	return e.Err
 }

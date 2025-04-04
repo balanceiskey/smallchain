@@ -2,6 +2,8 @@ package taskrun
 
 import (
 	"context"
+	"fmt"
+
 	// "fmt" - Commented out as it's currently unused
 	"time"
 
@@ -207,10 +209,10 @@ var _ = Describe("TaskRun Controller", func() {
 
 			By("reconciling the taskrun with a mock LLM client that returns an error")
 			reconciler, recorder := reconciler()
-			mockLLMClient := &llmclient.MockRawOpenAIClient{
+			mockLLMClient := &llmclient.MockLLMClient{
 				Error: fmt.Errorf("connection timeout"),
 			}
-			reconciler.newLLMClient = func(apiKey string) (llmclient.OpenAIClient, error) {
+			reconciler.newLLMClient = func(ctx context.Context, llm kubechain.LLM, apiKey string) (llmclient.LLMClient, error) {
 				return mockLLMClient, nil
 			}
 
@@ -249,14 +251,14 @@ var _ = Describe("TaskRun Controller", func() {
 
 			By("reconciling the taskrun with a mock LLM client that returns a 400 error")
 			reconciler, recorder := reconciler()
-			mockLLMClient := &llmclient.MockRawOpenAIClient{
+			mockLLMClient := &llmclient.MockLLMClient{
 				Error: &llmclient.LLMRequestError{
 					StatusCode: 400,
 					Message:    "invalid request: model not found",
 					Err:        fmt.Errorf("OpenAI API request failed"),
 				},
 			}
-			reconciler.newLLMClient = func(apiKey string) (llmclient.OpenAIClient, error) {
+			reconciler.newLLMClient = func(ctx context.Context, llm kubechain.LLM, apiKey string) (llmclient.LLMClient, error) {
 				return mockLLMClient, nil
 			}
 
